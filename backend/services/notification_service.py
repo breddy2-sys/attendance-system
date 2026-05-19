@@ -1,16 +1,15 @@
-"""Notification service for WebSocket-based in-app notifications.
+"""Notification service for in-app WebSocket notifications.
 
-No email, no SMS, no external APIs.
-All notifications stored in DB and pushed via WebSocket.
+No email, no SMS — pure WebSocket only.
+Notifications are persisted to DB and sent to connected clients.
 """
 
 import logging
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, desc
+from sqlalchemy import select, and_
 
-from backend.models.notification import Notification, NotificationType
-from backend.models.user import User
+from backend.models.notification import Notification
 from backend.schemas.notification import (
     NotificationCreate,
     NotificationResponse,
@@ -19,9 +18,12 @@ from backend.schemas.notification import (
 
 logger = logging.getLogger(__name__)
 
+# In-memory store of WebSocket connections: {user_id: set of WebSocket connections}
+_active_connections: dict[int, set] = {}
+
 
 class NotificationService:
-    """Service for managing in-app WebSocket notifications."""
+    """Service for managing in-app notifications."""
 
     @staticmethod
     async def create_notification(
@@ -31,13 +33,13 @@ class NotificationService:
         message: str,
         notification_type: str,
     ) -> NotificationResponse:
-        """Create and store notification.
+        """Create and persist a notification.
 
         Args:
             db: Database session.
-            recipient_id: User ID receiving notification.
+            recipient_id: User ID of recipient.
             title: Notification title.
-            message: Notification message body.
+            message: Notification message.
             notification_type: Type (zone_drop, reminder, etc.).
 
         Returns:
@@ -57,8 +59,7 @@ class NotificationService:
             await db.refresh(notification)
 
             logger.info(
-                f"Created notification {notification.id} for user {recipient_id}: "
-                f"{notification_type}"
+                f"Notification created for user {recipient_id}: {title}"
             )
             return NotificationResponse.from_orm(notification)
 
@@ -75,13 +76,13 @@ class NotificationService:
         message: str,
         notification_type: str,
     ) -> list[NotificationResponse]:
-        """Create notifications for multiple users.
+        """Create multiple notifications at once.
 
         Args:
             db: Database session.
             recipient_ids: List of user IDs.
             title: Notification title.
-            message: Notification message body.
+            message: Notification message.
             notification_type: Type of notification.
 
         Returns:
@@ -102,12 +103,15 @@ class NotificationService:
             db.add_all(notifications)
             await db.commit()
 
+            results = []
+            for notif in notifications:
+                await db.refresh(notif)
+                results.append(NotificationResponse.from_orm(notif))
+
             logger.info(
-                f"Created {len(notifications)} notifications of type {notification_type}"
+                f"Bulk notification created for {len(recipient_ids)} users: {title}"
             )
-            return [
-                NotificationResponse.from_orm(n) for n in notifications
-            ]
+            return results
 
         except Exception as e:
             await db.rollback()
@@ -121,7 +125,7 @@ class NotificationService:
         limit: int = 50,
         offset: int = 0,
     ) -> NotificationList:
-        """Get user's notifications (most recent first).
+        """Get notifications for a user.
 
         Args:
             db: Database session.
@@ -130,16 +134,16 @@ class NotificationService:
             offset: Pagination offset.
 
         Returns:
-            NotificationList with pagination.
+            NotificationList with unread count.
         """
         try:
-            # Count total
-            count_result = await db.execute(
+            # Get total count
+            total_result = await db.execute(
                 select(func.count(Notification.id)).filter(
                     Notification.recipient_id == user_id
                 )
             )
-            total = count_result.scalar() or 0
+            total_count = total_result.scalar() or 0
 
             # Get unread count
             unread_result = await db.execute(
@@ -152,23 +156,22 @@ class NotificationService:
             )
             unread_count = unread_result.scalar() or 0
 
-            # Get notifications
-            query = (
+            # Get paginated notifications (newest first)
+            notifs_result = await db.execute(
                 select(Notification)
                 .filter(Notification.recipient_id == user_id)
-                .order_by(desc(Notification.created_at))
+                .order_by(Notification.created_at.desc())
                 .limit(limit)
                 .offset(offset)
             )
-            result = await db.execute(query)
-            notifications = result.scalars().all()
+            notifications = notifs_result.scalars().all()
 
             return NotificationList(
                 notifications=[
                     NotificationResponse.from_orm(n) for n in notifications
                 ],
                 unread_count=unread_count,
-                total_count=total,
+                total_count=total_count,
             )
 
         except Exception as e:
@@ -176,7 +179,7 @@ class NotificationService:
             raise
 
     @staticmethod
-    async def mark_as_read(
+    async def mark_notification_read(
         db: AsyncSession,
         notification_id: int,
     ) -> NotificationResponse:
@@ -190,12 +193,10 @@ class NotificationService:
             Updated NotificationResponse.
         """
         try:
-            query = select(Notification).filter(
-                Notification.id == notification_id
+            notif_result = await db.execute(
+                select(Notification).filter(Notification.id == notification_id)
             )
-            result = await db.execute(query)
-            notification = result.scalar_one()
-
+            notification = notif_result.scalar_one()
             notification.is_read = True
             await db.commit()
             await db.refresh(notification)
@@ -204,86 +205,122 @@ class NotificationService:
 
         except Exception as e:
             await db.rollback()
-            logger.error(f"Error marking notification {notification_id} as read: {e}")
+            logger.error(f"Error marking notification read: {e}")
             raise
 
     @staticmethod
-    async def mark_all_as_read(
+    async def mark_all_read(
         db: AsyncSession,
         user_id: int,
     ) -> int:
-        """Mark all user's notifications as read.
+        """Mark all notifications for user as read.
 
         Args:
             db: Database session.
             user_id: User ID.
 
         Returns:
-            Number of notifications marked as read.
+            Number of notifications marked read.
         """
         try:
-            query = (
-                select(Notification)
-                .filter(
+            result = await db.execute(
+                select(Notification).filter(
                     and_(
                         Notification.recipient_id == user_id,
                         Notification.is_read == False,
                     )
                 )
             )
-            result = await db.execute(query)
             notifications = result.scalars().all()
 
-            for notification in notifications:
-                notification.is_read = True
+            for notif in notifications:
+                notif.is_read = True
 
             await db.commit()
-
-            count = len(notifications)
-            logger.info(f"Marked {count} notifications as read for user {user_id}")
-            return count
+            logger.info(f"Marked {len(notifications)} notifications read for user {user_id}")
+            return len(notifications)
 
         except Exception as e:
             await db.rollback()
-            logger.error(
-                f"Error marking all notifications as read for user {user_id}: {e}"
-            )
+            logger.error(f"Error marking all read for user {user_id}: {e}")
             raise
 
     @staticmethod
-    async def delete_notification(
-        db: AsyncSession,
-        notification_id: int,
-    ) -> bool:
-        """Delete a notification.
+    def add_connection(user_id: int, websocket):
+        """Register a WebSocket connection.
 
         Args:
-            db: Database session.
-            notification_id: Notification ID.
+            user_id: User ID.
+            websocket: WebSocket connection object.
+        """
+        if user_id not in _active_connections:
+            _active_connections[user_id] = set()
+        _active_connections[user_id].add(websocket)
+        logger.info(f"WebSocket connected for user {user_id}")
+
+    @staticmethod
+    def remove_connection(user_id: int, websocket):
+        """Unregister a WebSocket connection.
+
+        Args:
+            user_id: User ID.
+            websocket: WebSocket connection object.
+        """
+        if user_id in _active_connections:
+            _active_connections[user_id].discard(websocket)
+            if not _active_connections[user_id]:
+                del _active_connections[user_id]
+        logger.info(f"WebSocket disconnected for user {user_id}")
+
+    @staticmethod
+    async def broadcast_to_user(
+        user_id: int,
+        message: dict,
+    ) -> int:
+        """Broadcast message to all WebSocket connections of a user.
+
+        Args:
+            user_id: User ID.
+            message: Message dict to send.
 
         Returns:
-            True if deleted, False if not found.
+            Number of connections message was sent to.
         """
-        try:
-            query = select(Notification).filter(
-                Notification.id == notification_id
-            )
-            result = await db.execute(query)
-            notification = result.scalar()
+        connections = _active_connections.get(user_id, set())
+        disconnected = set()
 
-            if not notification:
-                return False
+        for websocket in connections:
+            try:
+                await websocket.send_json(message)
+            except Exception as e:
+                logger.warning(f"Error sending to WebSocket: {e}")
+                disconnected.add(websocket)
 
-            await db.delete(notification)
-            await db.commit()
+        # Clean up disconnected
+        for ws in disconnected:
+            NotificationService.remove_connection(user_id, ws)
 
-            logger.info(f"Deleted notification {notification_id}")
-            return True
+        return len(connections) - len(disconnected)
 
-        except Exception as e:
-            await db.rollback()
-            logger.error(f"Error deleting notification {notification_id}: {e}")
-            raise
+    @staticmethod
+    async def broadcast_to_users(
+        user_ids: list[int],
+        message: dict,
+    ) -> dict[int, int]:
+        """Broadcast message to multiple users.
+
+        Args:
+            user_ids: List of user IDs.
+            message: Message dict to send.
+
+        Returns:
+            Dict of {user_id: connections_sent}.
+        """
+        results = {}
+        for uid in user_ids:
+            count = await NotificationService.broadcast_to_user(uid, message)
+            results[uid] = count
+        return results
 
 
 from sqlalchemy import func

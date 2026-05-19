@@ -1,20 +1,23 @@
-"""Report generation service for PDF and CSV exports."""
+"""Report generation service.
+
+Generates attendance reports for subjects, departments, and system-wide.
+"""
 
 import logging
 from datetime import datetime, date
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 
-from backend.models.attendance_summary import AttendanceSummary
-from backend.models.attendance_session import AttendanceSession
+from backend.models.attendance_summary import AttendanceSummary, AttendanceZone
 from backend.models.subject import Subject
 from backend.models.student import Student
 from backend.models.department import Department
+from backend.models.faculty import Faculty
+from backend.models.user import User
 from backend.schemas.report import (
     SubjectReportRow,
     SubjectAttendanceReport,
     DepartmentReportSummary,
-    WeeklyReportSummary,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,7 +38,7 @@ class ReportService:
             subject_id: Subject ID.
 
         Returns:
-            SubjectAttendanceReport with all enrolled students.
+            SubjectAttendanceReport.
         """
         try:
             # Load subject
@@ -43,6 +46,22 @@ class ReportService:
                 select(Subject).filter(Subject.id == subject_id)
             )
             subject = subject_result.scalar_one()
+
+            # Load faculty name
+            faculty_name = "Unassigned"
+            if subject.faculty_id:
+                faculty_result = await db.execute(
+                    select(User).filter(
+                        User.id.in_(
+                            select(Faculty.user_id).filter(
+                                Faculty.id == subject.faculty_id
+                            )
+                        )
+                    )
+                )
+                faculty = faculty_result.scalar()
+                if faculty:
+                    faculty_name = faculty.full_name
 
             # Load all summaries for subject
             summaries_result = await db.execute(
@@ -52,56 +71,48 @@ class ReportService:
             )
             summaries = summaries_result.scalars().all()
 
-            # Load students
-            student_ids = [s.student_id for s in summaries]
-            students_result = await db.execute(
-                select(Student).filter(Student.id.in_(student_ids))
-            )
-            students_by_id = {s.id: s for s in students_result.scalars().all()}
-
             # Build report rows
-            rows = []
-            zone_distribution = {"safe": 0, "warning": 0, "danger": 0, "critical": 0}
-            total_pct = 0.0
+            rows: list[SubjectReportRow] = []
+            total_percentage = 0.0
+            zone_counts = {"safe": 0, "warning": 0, "danger": 0, "critical": 0}
 
             for summary in summaries:
-                student = students_by_id.get(summary.student_id)
-                if not student:
-                    continue
-
-                rows.append(
-                    SubjectReportRow(
-                        student_id=student.id,
-                        full_name=student.user.full_name if student.user else "Unknown",
-                        roll_number=student.roll_number,
-                        classes_attended=summary.classes_attended,
-                        classes_held=summary.classes_held,
-                        percentage=summary.current_percentage,
-                        zone=summary.zone,
-                    )
+                # Load student name
+                student_result = await db.execute(
+                    select(Student).filter(Student.id == summary.student_id)
                 )
+                student = student_result.scalar_one()
 
-                zone_distribution[summary.zone] += 1
-                total_pct += summary.current_percentage
+                row = SubjectReportRow(
+                    student_id=student.id,
+                    full_name=student.user.full_name if student.user else "Unknown",
+                    roll_number=student.roll_number,
+                    classes_attended=summary.classes_attended,
+                    classes_held=summary.classes_held,
+                    percentage=summary.current_percentage,
+                    zone=summary.zone,
+                )
+                rows.append(row)
+                total_percentage += summary.current_percentage
+                zone_counts[summary.zone] = zone_counts.get(summary.zone, 0) + 1
 
-            avg_pct = total_pct / len(rows) if rows else 0.0
+            # Calculate averages
+            avg_percentage = (
+                total_percentage / len(summaries) if summaries else 0.0
+            )
 
             return SubjectAttendanceReport(
                 subject_id=subject.id,
                 subject_name=subject.name,
-                faculty_name=(
-                    subject.faculty.user.full_name
-                    if subject.faculty and subject.faculty.user
-                    else "Unassigned"
-                ),
-                total_students=len(rows),
-                average_percentage=round(avg_pct, 1),
-                students_by_zone=zone_distribution,
+                faculty_name=faculty_name,
+                total_students=len(summaries),
+                average_percentage=round(avg_percentage, 1),
+                students_by_zone=zone_counts,
                 rows=rows,
             )
 
         except Exception as e:
-            logger.error(f"Error generating subject report: {e}")
+            logger.error(f"Error generating subject report for {subject_id}: {e}")
             raise
 
     @staticmethod
@@ -116,7 +127,7 @@ class ReportService:
             department_id: Department ID.
 
         Returns:
-            DepartmentReportSummary with all subjects.
+            DepartmentReportSummary.
         """
         try:
             # Load department
@@ -127,110 +138,49 @@ class ReportService:
 
             # Load all subjects in department
             subjects_result = await db.execute(
-                select(Subject).filter(Subject.department_id == department_id)
+                select(Subject).filter(
+                    and_(
+                        Subject.department_id == department_id,
+                        Subject.is_active == True,
+                    )
+                )
             )
             subjects = subjects_result.scalars().all()
 
             # Generate report for each subject
             subject_reports = []
-            total_pct = 0.0
             total_students = 0
-            zone_distribution = {"safe": 0, "warning": 0, "danger": 0, "critical": 0}
+            all_percentages = []
+            all_zone_counts = {"safe": 0, "warning": 0, "danger": 0, "critical": 0}
 
             for subject in subjects:
-                report = await ReportService.generate_subject_report(
+                subject_report = await ReportService.generate_subject_report(
                     db, subject.id
                 )
-                subject_reports.append(report)
-                total_pct += report.average_percentage * report.total_students
-                total_students += report.total_students
+                subject_reports.append(subject_report)
+                total_students += subject_report.total_students
+                all_percentages.extend(
+                    [row.percentage for row in subject_report.rows]
+                )
+                for zone, count in subject_report.students_by_zone.items():
+                    all_zone_counts[zone] = all_zone_counts.get(zone, 0) + count
 
-                for zone, count in report.students_by_zone.items():
-                    zone_distribution[zone] += count
-
-            avg_pct = total_pct / total_students if total_students > 0 else 0.0
+            # Calculate department averages
+            avg_attendance = (
+                sum(all_percentages) / len(all_percentages)
+                if all_percentages
+                else 0.0
+            )
 
             return DepartmentReportSummary(
                 department_id=department.id,
                 department_name=department.name,
                 total_students=total_students,
-                average_attendance=round(avg_pct, 1),
-                zone_distribution=zone_distribution,
+                average_attendance=round(avg_attendance, 1),
+                zone_distribution=all_zone_counts,
                 subjects=subject_reports,
             )
 
         except Exception as e:
             logger.error(f"Error generating department report: {e}")
-            raise
-
-    @staticmethod
-    async def generate_weekly_summary(
-        db: AsyncSession,
-        week_start: date,
-        week_end: date,
-    ) -> WeeklyReportSummary:
-        """Generate weekly attendance summary.
-
-        Args:
-            db: Database session.
-            week_start: Start date of week.
-            week_end: End date of week.
-
-        Returns:
-            WeeklyReportSummary.
-        """
-        try:
-            # Load all sessions in week
-            sessions_result = await db.execute(
-                select(AttendanceSession).filter(
-                    and_(
-                        AttendanceSession.date >= week_start,
-                        AttendanceSession.date <= week_end,
-                    )
-                )
-            )
-            sessions = sessions_result.scalars().all()
-            total_sessions = len(sessions)
-
-            # Count on-time vs late submissions
-            submitted_on_time = sum(
-                1 for s in sessions
-                if s.submitted_at.date() == s.date
-            )
-            late_submissions = total_sessions - submitted_on_time
-            missing_submissions = 0  # Would need timetable comparison
-
-            # Calculate average attendance
-            summaries_result = await db.execute(
-                select(AttendanceSummary)
-            )
-            summaries = summaries_result.scalars().all()
-
-            avg_pct = (
-                sum(s.current_percentage for s in summaries) / len(summaries)
-                if summaries
-                else 0.0
-            )
-
-            zone_distribution = {
-                "safe": sum(1 for s in summaries if s.zone == "safe"),
-                "warning": sum(1 for s in summaries if s.zone == "warning"),
-                "danger": sum(1 for s in summaries if s.zone == "danger"),
-                "critical": sum(1 for s in summaries if s.zone == "critical"),
-            }
-
-            return WeeklyReportSummary(
-                week_start=week_start,
-                week_end=week_end,
-                total_sessions=total_sessions,
-                submitted_on_time=submitted_on_time,
-                late_submissions=late_submissions,
-                missing_submissions=missing_submissions,
-                average_attendance=round(avg_pct, 1),
-                zone_distribution=zone_distribution,
-                anomalies=[],
-            )
-
-        except Exception as e:
-            logger.error(f"Error generating weekly summary: {e}")
             raise

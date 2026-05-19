@@ -1,4 +1,4 @@
-"""Initialize all services."""
+"""Initialize services package."""
 
 from backend.services.guidance_service import GuidanceService
 from backend.services.attendance_service import AttendanceService
