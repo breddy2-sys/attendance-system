@@ -1,60 +1,63 @@
-"""
-User model for authentication and authorization.
-Supports three roles: student, faculty, admin.
-"""
+"""User model with RBAC support."""
 
 from datetime import datetime
 from enum import Enum
-from sqlalchemy import Boolean, Column, DateTime, Enum as SQLEnum, Integer, String
-from sqlalchemy.orm import relationship
+from sqlalchemy import String, Boolean, DateTime, func
+from sqlalchemy.orm import declarative_base, Mapped, mapped_column, relationship
 
-from backend.database import Base
+Base = declarative_base()
 
 
 class UserRole(str, Enum):
-    """User role enumeration."""
-
+    """Role enumeration for users."""
     STUDENT = "student"
     FACULTY = "faculty"
     ADMIN = "admin"
 
 
 class User(Base):
-    """
-    User model representing system users.
-
+    """User model for authentication and authorization.
+    
     Attributes:
         id: Primary key.
         full_name: User's full name.
         email: Unique email address.
         hashed_password: Bcrypt hashed password.
         role: User role (student/faculty/admin).
-        is_active: Account activation status.
+        is_active: Account active status.
         created_at: Account creation timestamp.
     """
-
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    full_name = Column(String(255), nullable=False)
-    email = Column(String(255), unique=True, nullable=False, index=True)
-    hashed_password = Column(String(255), nullable=False)
-    role = Column(SQLEnum(UserRole), nullable=False, default=UserRole.STUDENT)
-    is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    full_name: Mapped[str] = mapped_column(String(255))
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(255))
+    role: Mapped[UserRole] = mapped_column(default=UserRole.STUDENT)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
 
     # Relationships
-    student = relationship("Student", back_populates="user", uselist=False)
-    faculty = relationship("Faculty", back_populates="user", uselist=False)
-    notifications = relationship("Notification", back_populates="recipient")
-    attendance_records = relationship(
-        "AttendanceRecord", foreign_keys="AttendanceRecord.marked_by_id"
+    student: Mapped["Student"] = relationship(back_populates="user")
+    faculty: Mapped["Faculty"] = relationship(back_populates="user")
+    attendance_records: Mapped[list["AttendanceRecord"]] = relationship(
+        back_populates="marked_by",
+        foreign_keys="AttendanceRecord.marked_by_id"
     )
-    leave_reviews = relationship(
-        "LeaveRequest", foreign_keys="LeaveRequest.reviewed_by_id"
+    leave_requests: Mapped[list["LeaveRequest"]] = relationship(
+        back_populates="reviewed_by",
+        foreign_keys="LeaveRequest.reviewed_by_id"
     )
-    audit_logs = relationship("AuditLog", back_populates="user")
-
-    def __repr__(self) -> str:
-        """Return string representation."""
-        return f"<User(id={self.id}, email={self.email}, role={self.role.value})>"
+    notifications: Mapped[list["Notification"]] = relationship(
+        back_populates="recipient"
+    )
+    audit_logs: Mapped[list["AuditLog"]] = relationship(
+        back_populates="user"
+    )
+    threshold_recommendations: Mapped[list["ThresholdRecommendation"]] = relationship(
+        back_populates="reviewed_by",
+        foreign_keys="ThresholdRecommendation.reviewed_by_id"
+    )
